@@ -102,3 +102,15 @@ def test_mod5_distractors_keep_value():
     noisy, v2 = mod5_with_distractors([1, 2, 3], ["+", "*"], random.Random(4), 2)
     assert v2 == v
     assert len(noisy) == len(toks) + 4
+
+
+def test_bracketed_steps_trainer_branch_routes_and_pads():
+    import random
+    import torch
+    from train_official import sample_train_batch, batch_loss, test_lengths
+    rng = random.Random(0)
+    kind, seq, lab, pos = sample_train_batch("bracketed-steps", 8, rng)
+    assert kind == "bsteps"
+    assert seq.shape[0] == 8 and lab.shape == pos.shape
+    assert ((pos == -1) == (lab == -100)).all()
+    assert test_lengths("bracketed-steps") == [16, 24, 32, 48, 64, 96]

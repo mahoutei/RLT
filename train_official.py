@@ -29,7 +29,7 @@ from RLT import RLT
 import official_tasks as T
 
 BASE_LR, MIN_LR, WARMUP = 1e-4, 5e-6, 200
-TASKS = ("parity", "addition", "mod5-flat", "mod5-bracketed", "s5-standard", "s5-swaps", "chain-mod5")
+TASKS = ("parity", "addition", "mod5-flat", "mod5-bracketed", "s5-standard", "s5-swaps", "chain-mod5", "bracketed-steps")
 
 
 def lr_schedule(step, total):
@@ -73,7 +73,7 @@ def build(dim, heads, enc, dec, vocab, swa=8, variant="rlt1", chunk_size=None):
 def vocab_of(task):
     return {"parity": 2, "addition": T.ADD_VOCAB, "mod5-flat": T.MOD_VOCAB,
             "mod5-bracketed": T.MOD_VOCAB, "s5-standard": 120, "s5-swaps": 120,
-            "chain-mod5": T.MOD_VOCAB}[task]
+            "chain-mod5": T.MOD_VOCAB, "bracketed-steps": T.MOD_VOCAB}[task]
 
 
 def sample_train_batch(task, micro, rng):
@@ -112,6 +112,9 @@ def sample_train_batch(task, micro, rng):
     if task == "chain-mod5":
         seq, lab, pos = T.chain_mod5_batch(micro, 4, rng.randint(0, 2**31 - 1))
         return ("chain", seq, lab, pos)
+    if task == "bracketed-steps":
+        seq, lab, pos = T.bracketed_steps_batch(micro, 16, rng.randint(0, 2**31 - 1))
+        return ("bsteps", seq, lab, pos)
     variant = "standard" if task == "s5-standard" else "swaps"
     L = 32
     return ("s5",) + T.s5_batch(micro, L, variant, rng.randint(0, 2**31 - 1)) + (L,)
@@ -133,6 +136,9 @@ def batch_loss(model, task, batch):
         _, seq, lab, _ = batch
         return F.cross_entropy(get(model(seq))[:, -1], lab)
     if kind == "chain":
+        _, seq, lab, pos = batch
+        return step_token_loss(get(model(seq)), pos, lab)
+    if kind == "bsteps":
         _, seq, lab, pos = batch
         return step_token_loss(get(model(seq)), pos, lab)
     _, seq, states, _ = batch  # s5: supervise every prefix state
@@ -196,6 +202,8 @@ def test_lengths(task):
         return [32, 40, 48, 64, 96, 128, 192, 256]
     if task == "chain-mod5":
         return [1, 2, 3, 4, 6, 8]
+    if task == "bracketed-steps":
+        return [16, 24, 32, 48, 64, 96]
     return [32, 48, 64, 96, 128, 192, 256, 512]
 
 
@@ -212,6 +220,12 @@ def test_acc(model, task, length):
         return (get(model(s)).argmax(-1)[:, -1] == st[:, -1]).float().mean().item() * 100
     if task == "chain-mod5":
         s, l, p = T.chain_mod5_batch(1024, length, T.DATA_SEED_TEST + length)
+        lg = get(model(s))
+        last_idx = (p != -1).sum(1) - 1
+        pred = lg[torch.arange(1024), p[torch.arange(1024), last_idx]].argmax(-1)
+        return (pred == l[torch.arange(1024), last_idx]).float().mean().item() * 100
+    if task == "bracketed-steps":
+        s, l, p = T.bracketed_steps_batch(1024, length, T.DATA_SEED_TEST + length)
         lg = get(model(s))
         last_idx = (p != -1).sum(1) - 1
         pred = lg[torch.arange(1024), p[torch.arange(1024), last_idx]].argmax(-1)
@@ -258,9 +272,11 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
         timed = step_times[1000:2000] if total_steps > 1000 else step_times
         mean_step = sum(timed) / max(1, len(timed))
         out[name] = {"best_val": best, "generalization": gen, "mean_step_s": mean_step}
-        if task == "chain-mod5":
+        if task in ("chain-mod5", "bracketed-steps"):
             with torch.no_grad():
-                s, l, p = T.chain_mod5_batch(1024, 4, T.DATA_SEED_TEST + 4)
+                probe_len = 4 if task == "chain-mod5" else 16
+                batch_fn = T.chain_mod5_batch if task == "chain-mod5" else T.bracketed_steps_batch
+                s, l, p = batch_fn(1024, probe_len, T.DATA_SEED_TEST + probe_len)
                 lg = get(model(s))
                 valid = (p != -1) & (l != -100)
                 pred = lg.gather(1, p.clamp(min=0).unsqueeze(-1).expand(-1, -1, lg.size(-1))).argmax(-1)
