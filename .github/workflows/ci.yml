@@ -1,0 +1,13 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install pytest einx einops rotary-embedding-torch torch-einops-utils x-mlps-pytorch x-transformers tqdm fire
+      - run: pytest tests/test_compositional.py tests/test_official_variants.py -q
