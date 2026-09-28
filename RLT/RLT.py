@@ -636,7 +636,7 @@ class RecurrentTransition(Module):
     def __init__(
         self,
         dim,
-        alpha = 1.,
+        alpha = 0.1,
         learned_alpha = False
     ):
         super().__init__()
@@ -699,7 +699,7 @@ class RLT(Module):
         num_kv_layers: int | None = None,
         layer_to_layer_mapping: Sequence[int] | None = None,
         ff_expansion_factor = 4.,
-        recurrent_transition_alpha = 1.,
+        recurrent_transition_alpha = 0.1,
         dec_sliding_window_size = 16,
         recurrent_block_size: int | Sequence[int] = 1,
         rotary_embed = True,
@@ -721,7 +721,9 @@ class RLT(Module):
         enc_depth_scale_residual = False,
         dec_depth_scale_residual = True,
         tie_embedding = True,
-        jitter_noise_delta = 0.
+        jitter_noise_delta = 0.,
+        use_feedback = True,
+        feedback_chunk_size: int | None = None
     ):
         super().__init__()
         has_num_tokens = exists(num_tokens)
@@ -815,22 +817,49 @@ class RLT(Module):
         self.split_heads = Rearrange('b n (l h d) -> l b h n d', l = num_kv_layers, h = cross_attn_kv_heads)
 
         # recurrence related
+        # use_feedback=False selects RLT-0 (official control): no learned
+        # initial state, state norm, gated merge or feedback projection;
+        # decoder receives encoder outputs directly.
+        # feedback_chunk_size=B>1 selects RLT-2 chunk semantics (App. I):
+        # state fixed within a chunk, committed at complete boundaries.
+        # B=1 recovers RLT-1 at identical weights.
+
+        assert use_feedback or not exists(recurrent_transition), 'RLT-0 removes the gated merge'
+        assert use_feedback or not glu_cross, 'RLT-0 removes the feedback projection'
+        assert use_feedback or not exists(recurrent_state_module), 'RLT-0 has no recurrent state module'
+        assert use_feedback or not (jitter_noise_delta > 0.), 'RLT-0 has no recurrent state to jitter'
+
+        if exists(feedback_chunk_size):
+            assert use_feedback, 'chunked feedback requires the feedback path (RLT-2 builds on RLT-1)'
+            assert isinstance(feedback_chunk_size, int) and feedback_chunk_size >= 1, 'chunk size B must be an integer >= 1'
+            recurrent_block_size = feedback_chunk_size
+
+        self.use_feedback = use_feedback
+        self.feedback_chunk_size = default(feedback_chunk_size, 1) if use_feedback else None
 
         self.tbptt_step_size = tbptt_step_size
 
-        self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
+        if use_feedback:
+            self.initial_state = nn.Parameter(torch.randn(dim) * 1e-2)
 
-        if not exists(recurrent_transition):
-            if glu_cross:
-                recurrent_transition = GLUCrossTransition(dim)
-            else:
-                recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
+            if not exists(recurrent_transition):
+                if glu_cross:
+                    recurrent_transition = GLUCrossTransition(dim)
+                else:
+                    recurrent_transition = RecurrentTransition(dim, alpha = recurrent_transition_alpha)
 
-        self.combine_encoded_token_and_state = recurrent_transition
+            self.combine_encoded_token_and_state = recurrent_transition
 
-        # norm the fused input from recurrence before feeding into the network (Xi Wang et al. - Full-bandwidth transformer)
+            # norm the fused input from recurrence before feeding into the network (Xi Wang et al. - Full-bandwidth transformer)
 
-        self.fused_norm = RMSNorm(dim)
+            self.fused_norm = RMSNorm(dim)
+        else:
+            # RLT-0: direct encoder input, no feedback parameters
+            self.initial_state = None
+            self.combine_encoded_token_and_state = None
+            self.fused_norm = nn.Identity()
+            assert not exists(tbptt_step_size), 'RLT-0 uses full BPTT without a TBPTT boundary'
+
         self.fused_input_norm = self.fused_norm
 
         self.jitter_noise_delta = jitter_noise_delta
@@ -1012,9 +1041,9 @@ class RLT(Module):
 
         is_boundary = (lambda _: True) if is_custom else (lambda idx: divisible_by(idx, block_size))
 
-        # maybe initial state
+        # maybe initial state (RLT-0 keeps state=None: direct encoder input)
 
-        if not exists(state):
+        if self.use_feedback and not exists(state):
             state = repeat(self.initial_state, 'd -> b 1 d', b = batch)
 
         # encode
@@ -1056,13 +1085,17 @@ class RLT(Module):
 
             # maybe jitter noise along recurrent state (Xi Wang et al. - Full-bandwidth transformer)
 
-            if self.training and has_jitter_noise_delta:
+            if self.use_feedback and self.training and has_jitter_noise_delta:
                 state = state + uniform_like(state, -jitter_noise_delta, jitter_noise_delta)
 
-            # combine encoded block with state (relies on broadcasting)
+            # combine encoded block with state (relies on broadcasting);
+            # RLT-0 feeds encoder outputs directly (z^0_t = e_t)
 
-            decoder_block = self.combine_encoded_token_and_state(state, encoded_block)
-            decoder_block = self.fused_norm(decoder_block)
+            if self.use_feedback:
+                decoder_block = self.combine_encoded_token_and_state(state, encoded_block)
+                decoder_block = self.fused_norm(decoder_block)
+            else:
+                decoder_block = encoded_block
 
             # slice the encoded key / values to the current sequence position, and map each decoder layer to its encoded layer
 
@@ -1086,10 +1119,11 @@ class RLT(Module):
             decoder_outputs.append(decoder_output)
 
             # set next state as decoder output only at a block boundary
+            # (RLT-0: no feedback state; partial RLT-2 chunks preserve it)
 
             should_update_state = update_state(total_index) if callable(update_state) else default(update_state, is_boundary(total_index))
 
-            if should_update_state:
+            if should_update_state and self.use_feedback:
                 state = decoder_output[:, -1:]
 
                 if self.has_recurrent_state_module:

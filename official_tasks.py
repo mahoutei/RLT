@@ -230,7 +230,10 @@ def s5_batch(batch_size: int, length: int, variant: str, seed: int):
 # ---------------------------------------------------------------------------
 
 def mean_sample_sd(vals: list[float]):
+    vals = [v for v in vals if v == v]  # drop NaN
     n = len(vals)
+    if n == 0:
+        return float("nan"), float("nan")
     m = sum(vals) / n
     if n < 2:
         return m, 0.0

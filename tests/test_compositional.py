@@ -123,3 +123,12 @@ def test_encode_bracketed_mod5_handles_parens():
     toks = encode_bracketed_mod5(tt)
     assert toks[0].item() == MOD_BOS and toks[-1].item() == MOD_EQ
     assert len(toks) == len(tt) + 2
+
+
+def test_mean_sample_sd_all_nan_returns_nan():
+    import math
+    from official_tasks import mean_sample_sd
+    m, sd = mean_sample_sd([float("nan"), float("nan")])
+    assert math.isnan(m) and math.isnan(sd)
+    m2, sd2 = mean_sample_sd([2.0, 4.0])
+    assert m2 == 3.0 and abs(sd2 - math.sqrt(2.0)) < 1e-12
