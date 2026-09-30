@@ -275,8 +275,33 @@ def test_acc(model, task, length):
     return float("nan")  # addition/mod5 grids need seq-gen harness; val only in smoke
 
 
+def validate_config(task, split, total_steps, global_batch, micro_batch, dim, heads,
+                    variant, chunk_size, activation, max_hours):
+    """Fail fast on configs that would silently waste a run. Raises ValueError."""
+    if task not in TASKS:
+        raise ValueError(f"unknown task {task!r}; expected one of {TASKS}")
+    if variant not in ("rlt1", "rlt0", "rlt2"):
+        raise ValueError(f"unknown variant {variant!r}")
+    if activation not in ("swiglu", "gelu"):
+        raise ValueError(f"unknown activation {activation!r}")
+    if variant == "rlt2" and not (chunk_size is not None and chunk_size >= 1):
+        raise ValueError("rlt2 needs chunk_size >= 1")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be > 0, got {total_steps}")
+    if dim % heads != 0:
+        raise ValueError(f"dim ({dim}) must be divisible by heads ({heads})")
+    if global_batch % micro_batch != 0:
+        raise ValueError(f"global_batch ({global_batch}) must be divisible by "
+                         f"micro_batch ({micro_batch}); else accumulation silently drops samples")
+    if max_hours is not None and max_hours < 0:
+        raise ValueError(f"max_hours must be >= 0, got {max_hours}")
+    enc, dec = split.split("+")
+    if dec == "0":
+        raise ValueError("split dec_depth 0 is unconstructible (residual scale 0 ** -0.5)")
+
+
 def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_seed, ckpt_dir,
-        variant="rlt1", chunk_size=None, activation="swiglu"):
+        variant="rlt1", chunk_size=None, activation="swiglu", max_hours=None):
     import time
     torch.manual_seed(init_seed)
     random.seed(init_seed)
@@ -292,11 +317,17 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
         opt = torch.optim.AdamW(model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), weight_decay=0.1)
         rng = random.Random(T.DATA_SEED_TRAIN + init_seed)
         best, best_state = float("inf"), None
-        accum = max(1, global_batch // micro_batch)
+        accum = global_batch // micro_batch
         step_times = []
         sys_samples = []
+        steps_done, capped = 0, False
+        t_start = time.perf_counter()
         for step in tqdm(range(total_steps), desc=f"{task}/{name}/s{init_seed}", leave=False):
+            if max_hours is not None and (time.perf_counter() - t_start) > max_hours * 3600:
+                capped = True
+                break
             t0 = time.perf_counter()
+            steps_done = step + 1
             model.train()
             opt.zero_grad()
             for _ in range(accum):
@@ -312,13 +343,20 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
                 if vl < best:
                     best = vl
                     best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        completed = steps_done >= total_steps and not capped
+        if best_state is None:
+            # capped before the first val probe (or val never improved on inf):
+            # keep current weights, mark best unknown (None serializes; inf does not).
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best = None
         model.load_state_dict(best_state)
         gen = {L: test_acc(model, task, L) for L in test_lengths(task)}
         # official averages steps 1001-2000; fall back to overall mean on short runs
         timed = step_times[1000:2000] if total_steps > 1000 else step_times
         mean_step = sum(timed) / max(1, len(timed))
         out[name] = {"best_val": best, "generalization": gen, "mean_step_s": mean_step,
-                     "system": _agg_sys(sys_samples)}
+                     "system": _agg_sys(sys_samples),
+                     "completed": completed, "steps_done": steps_done}
         if task in ("chain-mod5", "bracketed-steps"):
             with torch.no_grad():
                 probe_len = 4 if task == "chain-mod5" else 16
@@ -339,13 +377,14 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
                     rob[str(pr)] = (get(model(sn))[:, -1].argmax(-1) == ln).float().mean().item() * 100
                 out[name]["robustness"] = rob
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(best_state, ckpt_dir / f"{task}-{name}-seed{init_seed}.pt")
+        suffix = "" if completed else "-partial"
+        torch.save(best_state, ckpt_dir / f"{task}-{name}-seed{init_seed}{suffix}.pt")
     return out
 
 
 def main(task="parity", split="5+3", total_steps=2000, global_batch=512,
          micro_batch=32, dim=512, heads=4, smoke=False,
-         variant="rlt1", chunk_size=None, activation="swiglu",
+         variant="rlt1", chunk_size=None, activation="swiglu", max_hours=None,
          out="./logs/official.json"):
     assert task in TASKS, task
     assert variant in ("rlt1", "rlt0", "rlt2"), variant
@@ -354,10 +393,12 @@ def main(task="parity", split="5+3", total_steps=2000, global_batch=512,
         total_steps, global_batch, micro_batch, dim, heads = 20, 32, 8, 64, 4
     if task.startswith("mod5") and not smoke and total_steps == 2000:
         total_steps = 5000  # official mod-5 budget
+    validate_config(task, split, total_steps, global_batch, micro_batch, dim, heads,
+                    variant, chunk_size, activation, max_hours)
     per_seed = [run(task, split, total_steps, global_batch, micro_batch, dim, heads,
                     s, Path("./checkpoints/official"),
                     variant=variant, chunk_size=chunk_size,
-                    activation=activation) for s in T.INIT_SEEDS]
+                    activation=activation, max_hours=max_hours) for s in T.INIT_SEEDS]
     summary = {}
     names = per_seed[0].keys()
     for n in names:
