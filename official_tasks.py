@@ -161,7 +161,7 @@ def _random_tree(rng: random.Random, n_leaves: int):
 
 def encode_bracketed_mod5(tree_toks: list[str]):
     mp = {"+": 5, "-": 6, "*": 7, "(": 8, ")": 9}
-    toks = [MOD_BOS] + [mp.get(t, int(t)) for t in tree_toks] + [MOD_EQ]
+    toks = [MOD_BOS] + [mp[t] if t in mp else int(t) for t in tree_toks] + [MOD_EQ]
     return torch.tensor(toks, dtype=torch.long)
 
 
@@ -230,7 +230,10 @@ def s5_batch(batch_size: int, length: int, variant: str, seed: int):
 # ---------------------------------------------------------------------------
 
 def mean_sample_sd(vals: list[float]):
+    vals = [v for v in vals if v == v]  # drop NaN
     n = len(vals)
+    if n == 0:
+        return float("nan"), float("nan")
     m = sum(vals) / n
     if n < 2:
         return m, 0.0

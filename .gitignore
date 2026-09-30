@@ -218,3 +218,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RLT research artifacts (local runs, never committed)
+checkpoints/
+logs/
+plots/
+data/*.gz
+build_nb.log
+
+# Agent plan workspaces (process scratch, git history is the record)
+.superpowers/

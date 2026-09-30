@@ -114,3 +114,21 @@ def test_bracketed_steps_trainer_branch_routes_and_pads():
     assert seq.shape[0] == 8 and lab.shape == pos.shape
     assert ((pos == -1) == (lab == -100)).all()
     assert test_lengths("bracketed-steps") == [16, 24, 32, 48, 64, 96]
+
+
+def test_encode_bracketed_mod5_handles_parens():
+    import random
+    from official_tasks import sample_bracketed_mod5, encode_bracketed_mod5, MOD_BOS, MOD_EQ
+    tt, v = sample_bracketed_mod5(random.Random(0), 20)
+    toks = encode_bracketed_mod5(tt)
+    assert toks[0].item() == MOD_BOS and toks[-1].item() == MOD_EQ
+    assert len(toks) == len(tt) + 2
+
+
+def test_mean_sample_sd_all_nan_returns_nan():
+    import math
+    from official_tasks import mean_sample_sd
+    m, sd = mean_sample_sd([float("nan"), float("nan")])
+    assert math.isnan(m) and math.isnan(sd)
+    m2, sd2 = mean_sample_sd([2.0, 4.0])
+    assert m2 == 3.0 and abs(sd2 - math.sqrt(2.0)) < 1e-12

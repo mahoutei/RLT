@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: RLT Official-Protocol Reproduction and Scope Expansion
+message: If you use this reproduction harness, please cite it as below.
+type: software
+authors:
+  - family-names: Catiil
+    given-names: Dean
+repository-code: https://github.com/mahoutei/RLT
+license: MIT
+keywords:
+  - recurrent looped transformer
+  - length generalization
+  - latent reasoning
+  - mechanistic evaluation
+preferred-citation:
+  type: techreport
+  title: Recurrent Looped Transformer
+  authors:
+    - family-names: Zhang
+      given-names: Yifan
+  year: 2026
+  month: 9
+  url: https://github.com/yifanzhang-pro/recurrent-looped-tranformer

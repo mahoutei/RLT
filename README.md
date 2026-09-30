@@ -1,89 +1,107 @@
 <img src="./rlt.png" width="400"></img>
 
-## RLT (Recurrent Looped Transformer)
+# RLT — Official-Protocol Reproduction & Scope Expansion
 
-Unofficial implementation of the [Recurrent Looped Transformer](https://yifanzhang-pro.github.io/recurrent-looped-tranformer/) proposed by Yifan Zhang of Princeton.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.10-blue.svg)](./pyproject.toml)
+[![CI](https://github.com/mahoutei/RLT/actions/workflows/ci.yml/badge.svg)](https://github.com/mahoutei/RLT/actions)
 
-Will also do some exploration of the [Recurrent Transformer](https://arxiv.org/abs/2604.21215) proposed by Costin-Andrei Oncescu et al. of Harvard, if I have any remaining time
+Unofficial research reproduction of the [Recurrent Looped Transformer](https://yifanzhang-pro.github.io/recurrent-looped-tranformer/) (Zhang, Princeton) following the paper's official evaluation protocol (App. J): fixed data streams, init seeds 42/43/44, best-ID-loss checkpointing, plain-Transformer baselines — plus new compositional and robustness tasks that stress latent recurrence beyond length generalization.
 
-## Appreciation
+> Forked from [`lucidrains/RLT`](https://github.com/lucidrains/RLT) (model code). All training/evaluation harnesses here are original to this repo.
 
-- [Pranoy](https://github.com/pranoyr) for the PR on weight tying / sharing between encoder and decoder!
+## Contents
 
-## Install
+- [Status](#status) · [Tasks](#tasks) · [Prerequisites](#prerequisites) · [Quickstart](#quickstart) · [Repo map](#repo-map) · [Results](#results) · [Package usage](#package-usage) · [Appreciation](#appreciation) · [Citations](#citations)
+
+## Status
+
+- [x] 6 official algorithmic tasks (parity, addition, mod-5 flat/bracketed, S5 standard/swaps) with depth-8 splits
+- [x] Compositional chain tasks with per-step supervision (`chain-mod5`, bracketed steps)
+- [x] Robustness variants (parity bit-flip noise curves, mod-5 distractors)
+- [x] Colab notebook (GPU + Drive) and enwik8 language-modeling trainer
+- [ ] Paper-scale runs (currently smoke-validated; full summaries land in `logs/`)
+
+## Tasks
+
+| Family | Tasks | Train → test | Metric |
+|--------|-------|--------------|--------|
+| Official | parity, addition, mod5-flat, mod5-bracketed, s5-standard, s5-swaps | short → long (e.g. bits 3–40 → 256) | final-answer accuracy |
+| Compositional (new) | chain-mod5, bracketed steps | 1–4 ops → 6–8 ops | step accuracy + first-error position |
+| Robustness (new) | parity noise, mod-5 distractors | clean → noisy | accuracy-vs-noise curves |
+
+Details per task: [`docs/new-tasks-protocol.md`](./docs/new-tasks-protocol.md).
+
+## Prerequisites
+
+- Python ≥ 3.10, PyTorch (CUDA build for paper-scale runs; CPU suffices for smoke)
+- `data/enwik8.gz` for language-modeling runs (place it under `data/`)
+- Google Colab with GPU runtime for the notebook path (Drive holds logs/checkpoints)
+
+## Quickstart
 
 ```bash
-$ pip install rlt-pytorch
+pip install -e .          # or: pip install rlt-pytorch
+pip install x-transformers tqdm fire   # trainers
 ```
 
-## Usage
+```bash
+# Smoke check (CPU, minutes)
+python train_official.py --task parity --split 5+3 --smoke
+python train_official.py --task chain-mod5 --split 5+3 --smoke
+
+# Paper scale (GPU): d=512, 2000 steps (5000 for mod-5), batch 512
+python train_official.py --task parity --split 5+3
+python train_parity.py --split 5+3
+```
+
+Colab (GPU + Drive persistence): run `RLT_official_colab.ipynb` — set `SMOKE = True` first, then `False` for full runs.
+
+```bash
+pytest tests/ -q   # unit + protocol tests
+```
+
+## Repo map
+
+| Path | What |
+|------|------|
+| `RLT/` | Model code (upstream) |
+| `official_tasks.py` | Data generators: 6 official + chain/robustness tasks, fixed seeds |
+| `train_official.py` | Generic official-protocol trainer (all tasks, all splits) |
+| `train_parity.py` | Parity experiment script |
+| `train_enwik8.py` | Enwik8 language-modeling trainer (accelerate) |
+| `RLT_official_colab.ipynb` | Monolithic Colab notebook (model + tasks + trainer embedded) |
+| `docs/new-tasks-protocol.md` | Per-task protocol notes (seeds, commands, outputs) |
+
+## Results
+
+Smoke validation (tiny CPU configs — chance-level is expected; proves the pipeline, not the paper):
+
+| Run | plain | rlt1 |
+|-----|-------|------|
+| parity 1+1, 256-bit (chance ~50%) | 47.8 | 47.8 |
+| chain-mod5 5+3, 8 ops (chance 20%) | 8.8 | 27.4 |
+
+Full paper-scale numbers will be tabulated here from `logs/*_summary.json` (mean ± SD over seeds 42/43/44). Reference targets: parity 5+3/7+1 → 100% at 256 bits vs Transformer ~50%; swaps-S5 4+4 → ~56% final-state at 512 ops.
+
+## Package usage
 
 ```python
 import torch
 from RLT import RLT
 
-model = RLT(
-    num_tokens = 256,
-    dim = 512,
-    enc_depth = 4,
-    dec_depth = 4,
-    dec_sliding_window_size = 16,
-    tbptt_step_size = 16 # optional truncated bptt
-)
-
+model = RLT(num_tokens=256, dim=512, enc_depth=4, dec_depth=4,
+            dec_sliding_window_size=16, tbptt_step_size=16)
 tokens = torch.randint(0, 256, (2, 1024))
-
-# forward for loss
-
-loss = model(tokens, return_loss = True)
-loss.backward()
-
-# generate
-
-prompt = torch.randint(0, 256, (2, 32))
-
-sampled = model.generate(prompt, max_len = 128) # (2, 96)
-```
-
-To turn on [Next-Latent Prediction](https://arxiv.org/abs/2511.05963) (Teoh et al.):
-
-```python
-model = RLT(
-    num_tokens = 256,
-    dim = 512,
-    enc_depth = 4,
-    dec_depth = 4,
-    next_lat_loss = True
-)
-
-loss = model(tokens, return_loss = True)
+loss = model(tokens, return_loss=True)
 loss.backward()
 ```
 
-The recurrent block size can also vary across the sequence by passing `recurrent_lengths` - a sequence of block lengths that must sum to the sequence length
+Optional [Next-Latent Prediction](https://arxiv.org/abs/2511.05963): `RLT(..., next_lat_loss=True)`. Variable recurrent blocks via `recurrent_lengths`. See upstream README history for details.
 
-```python
-block_lengths = (1, 2, 5, 2, 1, 3)
+## Appreciation
 
-tokens = torch.randint(0, 256, (2, sum(block_lengths)))
-
-loss = model(tokens, return_loss = True, recurrent_lengths = block_lengths)
-loss.backward()
-
-# during generation, the recurrent state only advances at the block boundaries
-
-prompt = torch.randint(0, 256, (2, 2))
-
-sampled = model.generate(prompt, recurrent_lengths = block_lengths)
-```
-
-## Test
-
-Train on enwik8
-
-```bash
-$ uv run train_enwik8.py
-```
+- [Pranoy](https://github.com/pranoyr) for the PR on weight tying / sharing between encoder and decoder (upstream)!
 
 ## Citations
 
@@ -140,7 +158,7 @@ $ uv run train_enwik8.py
     year          = {2026},
     eprint        = {2608.08888},
     archivePrefix = {arXiv},
-    primaryClass  = {cs.LG},
-    url           = {https://arxiv.org/abs/2608.08888}
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2608.08888}
 }
 ```
