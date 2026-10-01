@@ -132,3 +132,31 @@ def test_mean_sample_sd_all_nan_returns_nan():
     assert math.isnan(m) and math.isnan(sd)
     m2, sd2 = mean_sample_sd([2.0, 4.0])
     assert m2 == 3.0 and abs(sd2 - math.sqrt(2.0)) < 1e-12
+
+
+def test_walk_batch_deterministic_sign_labels():
+    import torch
+    from official_tasks import sample_walk_batch
+    s1, l1 = sample_walk_batch(8, 12, seed=5)
+    s2, l2 = sample_walk_batch(8, 12, seed=5)
+    assert torch.equal(s1, s2) and torch.equal(l1, l2)
+    assert s1.shape == (8, 12) and l1.shape == (8,)
+    assert set(l1.tolist()) <= {0, 1}
+    disp = s1.float().mul(2).sub(1).sum(-1)
+    assert torch.equal(l1, (disp > 0).long())
+
+
+def test_walk2d_batch_deterministic_quadrant_labels():
+    import torch
+    from official_tasks import sample_walk2d_batch
+    s1, l1 = sample_walk2d_batch(8, 12, seed=5)
+    s2, l2 = sample_walk2d_batch(8, 12, seed=5)
+    assert torch.equal(s1, s2) and torch.equal(l1, l2)
+    assert s1.shape == (8, 12) and l1.shape == (8,)
+    assert set(s1.flatten().tolist()) <= {0, 1, 2, 3}
+    assert set(l1.tolist()) <= {0, 1, 2, 3}
+    dx = (s1 == 0).float() - (s1 == 1).float()
+    dy = (s1 == 2).float() - (s1 == 3).float()
+    sx = (dx.sum(-1) > 0).long()
+    sy = (dy.sum(-1) > 0).long()
+    assert torch.equal(l1, 2 * sx + sy)
