@@ -66,7 +66,7 @@ from RLT import RLT
 import official_tasks as T
 
 BASE_LR, MIN_LR, WARMUP = 1e-4, 5e-6, 200
-TASKS = ("parity", "addition", "mod5-flat", "mod5-bracketed", "s5-standard", "s5-swaps", "chain-mod5", "bracketed-steps", "walk")
+TASKS = ("parity", "addition", "mod5-flat", "mod5-bracketed", "s5-standard", "s5-swaps", "chain-mod5", "bracketed-steps", "walk", "walk2d")
 
 
 def lr_schedule(step, total):
@@ -116,7 +116,7 @@ def vocab_of(task):
     return {"parity": 2, "addition": T.ADD_VOCAB, "mod5-flat": T.MOD_VOCAB,
             "mod5-bracketed": T.MOD_VOCAB, "s5-standard": 120, "s5-swaps": 120,
             "chain-mod5": T.MOD_VOCAB, "bracketed-steps": T.MOD_VOCAB,
-            "walk": 2}[task]
+            "walk": 2, "walk2d": 4}[task]
 
 
 def sample_train_batch(task, micro, rng):
@@ -126,6 +126,9 @@ def sample_train_batch(task, micro, rng):
     if task == "walk":
         N = rng.randint(3, 40)
         return ("walk",) + T.sample_walk_batch(micro, N, rng.randint(0, 2**31 - 1)) + (N,)
+    if task == "walk2d":
+        N = rng.randint(3, 40)
+        return ("walk2d",) + T.sample_walk2d_batch(micro, N, rng.randint(0, 2**31 - 1)) + (N,)
     if task == "addition":
         Lm = T.addition_max_len()
         toks, masks, labs = [], [], []
@@ -169,7 +172,7 @@ def sample_train_batch(task, micro, rng):
 def batch_loss(model, task, batch):
     kind = batch[0]
     get = lambda o: o[0] if isinstance(o, tuple) else o
-    if kind in ("parity", "walk"):
+    if kind in ("parity", "walk", "walk2d"):
         _, seq, lab, _ = batch
         return F.cross_entropy(get(model(seq))[:, -1], lab)
     if kind == "addition":
@@ -216,8 +219,9 @@ def first_error_position(pred, true, valid):
 def val_score(model, task, seed_base=0):
     model.eval()
     get = lambda o: o[0] if isinstance(o, tuple) else o
-    if task in ("parity", "walk"):
-        batch_fn = T.make_parity_batch if task == "parity" else T.sample_walk_batch
+    if task in ("parity", "walk", "walk2d"):
+        batch_fn = {"parity": T.make_parity_batch, "walk": T.sample_walk_batch,
+                    "walk2d": T.sample_walk2d_batch}[task]
         tot_l = tot_a = 0.0
         for L in (32, 36, 40):
             s, l = batch_fn(256, L, T.DATA_SEED_VAL + L)
@@ -239,7 +243,7 @@ def val_score(model, task, seed_base=0):
 
 
 def test_lengths(task):
-    if task in ("parity", "walk"):
+    if task in ("parity", "walk", "walk2d"):
         return [32, 40, 48, 64, 96, 128, 192, 256]
     if task == "addition":
         return [9, 10, 11, 12, 14, 16, 32]
@@ -258,8 +262,9 @@ def test_lengths(task):
 def test_acc(model, task, length):
     get = lambda o: o[0] if isinstance(o, tuple) else o
     model.eval()
-    if task in ("parity", "walk"):
-        batch_fn = T.make_parity_batch if task == "parity" else T.sample_walk_batch
+    if task in ("parity", "walk", "walk2d"):
+        batch_fn = {"parity": T.make_parity_batch, "walk": T.sample_walk_batch,
+                    "walk2d": T.sample_walk2d_batch}[task]
         s, l = batch_fn(1024, length, T.DATA_SEED_TEST + length)
         return (get(model(s))[:, -1].argmax(-1) == l).float().mean().item() * 100
     if task in ("s5-standard", "s5-swaps"):
