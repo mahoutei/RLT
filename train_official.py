@@ -216,6 +216,22 @@ def first_error_position(pred, true, valid):
 
 
 @torch.no_grad()
+def _eval_final(model, seq, lab, bs=32):
+    """Chunked final-position loss/accuracy over one batch. Same samples and
+    same mean as a single big forward; chunking keeps peak RSS flat on
+    small CPU boxes (1024x256 evals OOM a 7GB machine otherwise).
+    # ponytail: fixed 128; raise only if a GPU run is eval-bound."""
+    get = lambda o: o[0] if isinstance(o, tuple) else o
+    tot_loss, tot_c, tot_n = 0.0, 0, 0
+    for i in range(0, seq.size(0), bs):
+        lg = get(model(seq[i:i + bs]))[:, -1]
+        tot_loss += F.cross_entropy(lg, lab[i:i + bs], reduction="sum").item()
+        tot_c += (lg.argmax(-1) == lab[i:i + bs]).sum().item()
+        tot_n += lab[i:i + bs].numel()
+    return tot_loss / tot_n, tot_c / tot_n * 100
+
+
+@torch.no_grad()
 def val_score(model, task, seed_base=0):
     model.eval()
     get = lambda o: o[0] if isinstance(o, tuple) else o
@@ -225,9 +241,9 @@ def val_score(model, task, seed_base=0):
         tot_l = tot_a = 0.0
         for L in (32, 36, 40):
             s, l = batch_fn(256, L, T.DATA_SEED_VAL + L)
-            lg = get(model(s))
-            tot_l += F.cross_entropy(lg[:, -1], l).item()
-            tot_a += (lg[:, -1].argmax(-1) == l).float().mean().item()
+            el, ea = _eval_final(model, s, l)
+            tot_l += el
+            tot_a += ea
         return tot_l / 3, tot_a / 3 * 100
     if task in ("s5-standard", "s5-swaps"):
         v = "standard" if task == "s5-standard" else "swaps"
@@ -266,7 +282,7 @@ def test_acc(model, task, length):
         batch_fn = {"parity": T.make_parity_batch, "walk": T.sample_walk_batch,
                     "walk2d": T.sample_walk2d_batch}[task]
         s, l = batch_fn(1024, length, T.DATA_SEED_TEST + length)
-        return (get(model(s))[:, -1].argmax(-1) == l).float().mean().item() * 100
+        return _eval_final(model, s, l)[1]
     if task in ("s5-standard", "s5-swaps"):
         v = "standard" if task == "s5-standard" else "swaps"
         s, st = T.s5_batch(1024, length, v, T.DATA_SEED_TEST + length)
