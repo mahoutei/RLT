@@ -25,6 +25,43 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 from x_transformers import TransformerWrapper, Decoder
 
+
+def system_stats() -> dict:
+    """Best-effort host stats. Mirrors train_enwik8.system_stats; missing tools mean missing keys."""
+    stats: dict = {}
+    try:
+        import psutil
+        stats["cpu_pct"] = psutil.cpu_percent()
+        stats["ram_gb"] = psutil.virtual_memory().used / 1e9
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output = True, text = True, timeout = 10)
+        utils, mems = [], []
+        for line in out.stdout.strip().splitlines():
+            u, m = line.split(",")
+            utils.append(float(u))
+            mems.append(float(m))
+        if utils:
+            stats["gpu_util_pct"] = sum(utils) / len(utils)
+            stats["gpu_mem_mb"] = sum(mems)
+    except Exception:
+        pass
+    return stats
+
+
+def _agg_sys(samples: list) -> dict:
+    def agg(key):
+        v = [s[key] for s in samples if isinstance(s.get(key), (int, float))]
+        return {"avg": sum(v) / len(v), "peak": max(v)} if v else None
+    return {"gpu_util_pct": agg("gpu_util_pct"), "gpu_mem_mb": agg("gpu_mem_mb"),
+            "cpu_pct": agg("cpu_pct"), "ram_gb": agg("ram_gb"),
+            "num_samples": len(samples)}
+
 from RLT import RLT
 import official_tasks as T
 
@@ -39,7 +76,12 @@ def lr_schedule(step, total):
     return MIN_LR + 0.5 * (BASE_LR - MIN_LR) * (1 + math.cos(math.pi * p))
 
 
-def build(dim, heads, enc, dec, vocab, swa=8, variant="rlt1", chunk_size=None):
+def build(dim, heads, enc, dec, vocab, swa=8, variant="rlt1", chunk_size=None,
+          activation="swiglu"):
+    """activation: 'swiglu' (status quo) or 'gelu'. Toggles the plain baseline's
+    x_transformers FF (GLU+SwiGLU vs plain GELU). RLT's internal blocks are
+    GELU-fixed, so this ablates the baseline FF, not the whole stack."""
+    assert activation in ("swiglu", "gelu"), activation
     dim_head = dim // heads
     ffn_mult = 1365 / 512
     plain = TransformerWrapper(
@@ -47,7 +89,7 @@ def build(dim, heads, enc, dec, vocab, swa=8, variant="rlt1", chunk_size=None):
         attn_layers=Decoder(dim=dim, depth=enc + dec, heads=heads,
                             attn_dim_head=dim_head, rotary_pos_emb=True,
                             rotary_emb_dim=min(dim_head, 64),
-                            use_rmsnorm=True, ff_glu=True, ff_mult=ffn_mult))
+                            use_rmsnorm=True, ff_glu=(activation == "swiglu"), ff_mult=ffn_mult))
     if variant == "rlt0":
         # official control: no feedback, full BPTT, -787,968 params/split at d=512
         rlt = RLT(num_tokens=vocab, dim=dim, enc_depth=enc, dec_depth=dec,
@@ -233,25 +275,59 @@ def test_acc(model, task, length):
     return float("nan")  # addition/mod5 grids need seq-gen harness; val only in smoke
 
 
+def validate_config(task, split, total_steps, global_batch, micro_batch, dim, heads,
+                    variant, chunk_size, activation, max_hours):
+    """Fail fast on configs that would silently waste a run. Raises ValueError."""
+    if task not in TASKS:
+        raise ValueError(f"unknown task {task!r}; expected one of {TASKS}")
+    if variant not in ("rlt1", "rlt0", "rlt2"):
+        raise ValueError(f"unknown variant {variant!r}")
+    if activation not in ("swiglu", "gelu"):
+        raise ValueError(f"unknown activation {activation!r}")
+    if variant == "rlt2" and not (chunk_size is not None and chunk_size >= 1):
+        raise ValueError("rlt2 needs chunk_size >= 1")
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be > 0, got {total_steps}")
+    if dim % heads != 0:
+        raise ValueError(f"dim ({dim}) must be divisible by heads ({heads})")
+    if global_batch % micro_batch != 0:
+        raise ValueError(f"global_batch ({global_batch}) must be divisible by "
+                         f"micro_batch ({micro_batch}); else accumulation silently drops samples")
+    if max_hours is not None and max_hours < 0:
+        raise ValueError(f"max_hours must be >= 0, got {max_hours}")
+    enc, dec = split.split("+")
+    if dec == "0":
+        raise ValueError("split dec_depth 0 is unconstructible (residual scale 0 ** -0.5)")
+
+
 def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_seed, ckpt_dir,
-        variant="rlt1", chunk_size=None):
+        variant="rlt1", chunk_size=None, activation="swiglu", max_hours=None):
     import time
     torch.manual_seed(init_seed)
     random.seed(init_seed)
     enc, dec = map(int, split.split("+"))
     vocab = vocab_of(task)
     tag = variant if variant != "rlt2" else f"rlt2-b{chunk_size}"
+    tag = f"{tag}-{activation}" if activation != "swiglu" else tag
     get = lambda o: o[0] if isinstance(o, tuple) else o
     out = {}
     for name, model in zip((f"plain-{enc+dec}", f"{tag}-{split}"),
-                           build(dim, heads, enc, dec, vocab, variant=variant, chunk_size=chunk_size)):
+                           build(dim, heads, enc, dec, vocab, variant=variant, chunk_size=chunk_size,
+                                 activation=activation)):
         opt = torch.optim.AdamW(model.parameters(), lr=BASE_LR, betas=(0.9, 0.95), weight_decay=0.1)
         rng = random.Random(T.DATA_SEED_TRAIN + init_seed)
         best, best_state = float("inf"), None
-        accum = max(1, global_batch // micro_batch)
+        accum = global_batch // micro_batch
         step_times = []
+        sys_samples = []
+        steps_done, capped = 0, False
+        t_start = time.perf_counter()
         for step in tqdm(range(total_steps), desc=f"{task}/{name}/s{init_seed}", leave=False):
+            if max_hours is not None and (time.perf_counter() - t_start) > max_hours * 3600:
+                capped = True
+                break
             t0 = time.perf_counter()
+            steps_done = step + 1
             model.train()
             opt.zero_grad()
             for _ in range(accum):
@@ -263,15 +339,24 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
             step_times.append(time.perf_counter() - t0)
             if (step + 1) % 100 == 0 or step == total_steps - 1:
                 vl, _ = val_score(model, task)
+                sys_samples.append(system_stats())
                 if vl < best:
                     best = vl
                     best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        completed = steps_done >= total_steps and not capped
+        if best_state is None:
+            # capped before the first val probe (or val never improved on inf):
+            # keep current weights, mark best unknown (None serializes; inf does not).
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best = None
         model.load_state_dict(best_state)
         gen = {L: test_acc(model, task, L) for L in test_lengths(task)}
         # official averages steps 1001-2000; fall back to overall mean on short runs
         timed = step_times[1000:2000] if total_steps > 1000 else step_times
         mean_step = sum(timed) / max(1, len(timed))
-        out[name] = {"best_val": best, "generalization": gen, "mean_step_s": mean_step}
+        out[name] = {"best_val": best, "generalization": gen, "mean_step_s": mean_step,
+                     "system": _agg_sys(sys_samples),
+                     "completed": completed, "steps_done": steps_done}
         if task in ("chain-mod5", "bracketed-steps"):
             with torch.no_grad():
                 probe_len = 4 if task == "chain-mod5" else 16
@@ -292,23 +377,28 @@ def run(task, split, total_steps, global_batch, micro_batch, dim, heads, init_se
                     rob[str(pr)] = (get(model(sn))[:, -1].argmax(-1) == ln).float().mean().item() * 100
                 out[name]["robustness"] = rob
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(best_state, ckpt_dir / f"{task}-{name}-seed{init_seed}.pt")
+        suffix = "" if completed else "-partial"
+        torch.save(best_state, ckpt_dir / f"{task}-{name}-seed{init_seed}{suffix}.pt")
     return out
 
 
 def main(task="parity", split="5+3", total_steps=2000, global_batch=512,
          micro_batch=32, dim=512, heads=4, smoke=False,
-         variant="rlt1", chunk_size=None,
+         variant="rlt1", chunk_size=None, activation="swiglu", max_hours=None,
          out="./logs/official.json"):
     assert task in TASKS, task
     assert variant in ("rlt1", "rlt0", "rlt2"), variant
+    assert activation in ("swiglu", "gelu"), activation
     if smoke:
         total_steps, global_batch, micro_batch, dim, heads = 20, 32, 8, 64, 4
     if task.startswith("mod5") and not smoke and total_steps == 2000:
         total_steps = 5000  # official mod-5 budget
+    validate_config(task, split, total_steps, global_batch, micro_batch, dim, heads,
+                    variant, chunk_size, activation, max_hours)
     per_seed = [run(task, split, total_steps, global_batch, micro_batch, dim, heads,
                     s, Path("./checkpoints/official"),
-                    variant=variant, chunk_size=chunk_size) for s in T.INIT_SEEDS]
+                    variant=variant, chunk_size=chunk_size,
+                    activation=activation, max_hours=max_hours) for s in T.INIT_SEEDS]
     summary = {}
     names = per_seed[0].keys()
     for n in names:
@@ -320,7 +410,8 @@ def main(task="parity", split="5+3", total_steps=2000, global_batch=512,
     steps = {n: sum(r[n]["mean_step_s"] for r in per_seed) / len(per_seed) for n in names}
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps({"task": task, "split": split, "variant": variant,
-                                     "chunk_size": chunk_size, "per_seed": per_seed,
+                                     "chunk_size": chunk_size, "activation": activation,
+                                     "per_seed": per_seed,
                                      "mean_step_s": steps,
                                      "summary": {k: {str(k2): v2 for k2, v2 in v.items()} for k, v in summary.items()}}, indent=2))
     print(f"\n{task} {split} {variant} (mean +- SD over {T.INIT_SEEDS}):")
