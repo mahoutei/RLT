@@ -44,6 +44,15 @@ def make_parity_batch(batch_size: int, length: int, seed: int):
     return seq, labels
 
 
+def sample_walk_batch(batch_size: int, n_steps: int, seed: int):
+    """1D symmetric walk: tokens 0/1 mean steps -1/+1. Returns (seq [B,N],
+    sign(final displacement) [B]: 1 if end > start else 0). Deterministic."""
+    g = torch.Generator().manual_seed(seed)
+    seq = torch.randint(0, 2, (batch_size, n_steps), generator=g)
+    displacement = seq.float().mul(2).sub(1).sum(dim=-1)
+    return seq, (displacement > 0).long()
+
+
 def sample_parity_length(rng: random.Random, lo: int = 3, hi: int = 40):
     return rng.randint(lo, hi)
 
