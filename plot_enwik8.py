@@ -38,9 +38,11 @@ def read_jsonl(log_file: str | Path):
     val_steps, val_loss = [], []
     samples = []
     run_config = {}
+    systems: list = []
+    traces: list = []
     log_file = Path(log_file)
     if not log_file.exists():
-        return train_steps, train_loss, val_steps, val_loss, samples, run_config
+        return train_steps, train_loss, val_steps, val_loss, samples, run_config, systems, traces
     with log_file.open() as f:
         for line in f:
             line = line.strip()
@@ -54,14 +56,18 @@ def read_jsonl(log_file: str | Path):
             if t == "train":
                 train_steps.append(int(r["step"]))
                 train_loss.append(float(r["train_loss"]))
+                if isinstance(r.get("system"), dict) and r["system"]:
+                    systems.append((int(r["step"]), r["system"]))
             elif t == "val":
                 val_steps.append(int(r["step"]))
                 val_loss.append(float(r["val_loss"]))
             elif t == "sample":
                 samples.append(r)
+            elif t == "gputrace":
+                traces.append(r)
             elif t == "run_config":
                 run_config = r
-    return train_steps, train_loss, val_steps, val_loss, samples, run_config
+    return train_steps, train_loss, val_steps, val_loss, samples, run_config, systems, traces
 
 
 LEGACY_RE = re.compile(r"(\d+)/\d+\s+\[.*?loss=([\d.]+)")
@@ -108,7 +114,7 @@ def main(
     out = Path(out_dir)
     out.mkdir(parents = True, exist_ok = True)
 
-    train_steps, train_loss, val_steps, val_loss, samples, run_config = read_jsonl(log_file)
+    train_steps, train_loss, val_steps, val_loss, samples, run_config, systems, traces = read_jsonl(log_file)
 
     legacy_steps, legacy_loss = [], []
     if legacy_log:
@@ -159,6 +165,31 @@ def main(
     fig.savefig(out / "bpc.png", dpi = 150)
     plt.close(fig)
 
+    # --- gpu trace plot ---
+    tsteps = [int(r["step"]) for r in traces if "step" in r]
+    mem_alloc = [float(r["mem_alloc_mb"]) for r in traces if "mem_alloc_mb" in r]
+    mem_res = [float(r["mem_reserved_mb"]) for r in traces if "mem_reserved_mb" in r]
+    sys_steps = [s for s, _ in systems]
+    sys_util = [s["gpu_util_pct"] for _, s in systems if isinstance(s.get("gpu_util_pct"), (int, float))]
+    if tsteps and mem_alloc:
+        fig, ax = plt.subplots(figsize = (9, 5))
+        ax.plot(tsteps[:len(mem_alloc)], mem_alloc, label = "alloc MB (torch)")
+        if mem_res:
+            ax.plot(tsteps[:len(mem_res)], mem_res, label = "reserved MB (torch)")
+        if sys_util:
+            ax2 = ax.twinx()
+            ax2.plot(sys_steps[:len(sys_util)], sys_util, "o-", color = "tab:orange",
+                     markersize = 3, label = "util % (nvidia-smi)")
+            ax2.set_ylabel("GPU util %")
+        ax.set_xlabel("step")
+        ax.set_ylabel("GPU memory MB")
+        ax.set_title("gpu trace")
+        ax.legend(loc = "upper left")
+        ax.grid(alpha = 0.3)
+        fig.tight_layout()
+        fig.savefig(out / "gpu.png", dpi = 150)
+        plt.close(fig)
+
     # --- samples markdown ---
     if samples:
         md = ["# Generation samples\n"]
@@ -169,6 +200,22 @@ def main(
         (out / "samples.md").write_text("\n".join(md))
 
     # --- summary ---
+    def _col(key):
+        return [s.get(key) for _, s in systems if isinstance(s.get(key), (int, float))]
+
+    def _agg(key):
+        v = _col(key)
+        return {"avg": sum(v) / len(v), "peak": max(v)} if v else None
+
+    sys_summary = {
+        "gpu_util_pct": _agg("gpu_util_pct"),
+        "gpu_mem_mb": _agg("gpu_mem_mb"),
+        "cpu_pct": _agg("cpu_pct"),
+        "ram_gb": _agg("ram_gb"),
+        "num_samples": len(systems),
+        "trace_mem_alloc_peak_mb": max(mem_alloc) if mem_alloc else None,
+        "trace_points": len(tsteps),
+    }
     summary = {
         "log_file": str(log_file),
         "legacy_log": legacy_log,
@@ -182,10 +229,66 @@ def main(
         "final_val_loss": val_loss[-1] if val_loss else None,
         "final_val_ppl": math.exp(val_loss[-1]) if val_loss else None,
         "run_config": run_config,
+        "system": sys_summary,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent = 2))
     print(json.dumps(summary, indent = 2))
     print(f"\nwrote {out / 'loss.png'}, {out / 'bpc.png'}" + (f", {out / 'samples.md'}" if samples else ""))
+    write_report(out, summary, samples, traces)
+    print(f"wrote {out / 'report.html'}")
+
+
+def write_report(out: Path, summary: dict, samples: list, traces: list):
+    """Single self-contained HTML report: embedded figures, config, metrics,
+    system stats, samples. Zero JS, opens anywhere."""
+    import base64
+    import html
+
+    def img(name):
+        p = out / name
+        if not p.exists():
+            return ""
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        return f'<img src="data:image/png;base64,{b64}" style="max-width:100%">'
+
+    def table(rows):
+        return "<table>" + "".join(
+            f"<tr><th>{html.escape(str(k))}</th><td>{html.escape(str(v))}</td></tr>"
+            for k, v in rows) + "</table>"
+
+    cfg = summary.get("run_config", {}) or {}
+    metrics = [(k, v) for k, v in summary.items() if k not in ("run_config", "system")]
+    sys = summary.get("system", {}) or {}
+    has_sys = bool(sys.get("num_samples"))
+    sysrows = []
+    for k, v in sys.items():
+        if k == "num_samples" or v is None:
+            continue
+        if isinstance(v, dict):
+            sysrows.append((k, "avg=%.1f peak=%.1f" % (v["avg"], v["peak"])))
+        else:
+            sysrows.append((k, v))
+    samp_html = "".join(
+        f"<h3>step {html.escape(str(s.get('step')))}</h3>"
+        f"<p><b>prompt:</b> <code>{html.escape(str(s.get('prompt', '')))}</code></p>"
+        f"<p><b>output:</b> <code>{html.escape(str(s.get('output', '')))}</code></p>"
+        for s in samples[-20:])
+
+    page = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>enwik8 run report</title>
+<style>body{{font-family:sans-serif;max-width:960px;margin:auto;padding:1em}}
+table{{border-collapse:collapse;margin:1em 0}}th,td{{border:1px solid #ccc;padding:4px 10px;text-align:left}}
+code{{white-space:pre-wrap;word-break:break-word}}</style></head>
+<body><h1>enwik8 run report</h1>
+<h2>Loss</h2>{img("loss.png")}
+<h2>Bits per char</h2>{img("bpc.png")}
+<h2>GPU trace</h2>{img("gpu.png") if traces else "<p>no per-step traces logged (GPU run with default trace_every)</p>"}
+<h2>Run config</h2>{table(sorted(cfg.items())) if cfg else "<p>n/a</p>"}
+<h2>Metrics</h2>{table(metrics)}
+<h2>System</h2>{table(sysrows) if has_sys else "<p>no system stats logged (psutil / nvidia-smi unavailable at train time)</p>"}
+<h2>Samples</h2>{samp_html if samp_html else "<p>n/a</p>"}
+</body></html>"""
+    (out / "report.html").write_text(page)
 
 
 if __name__ == "__main__":

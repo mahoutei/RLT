@@ -123,6 +123,33 @@ def append_jsonl(log_file: Path, record: dict):
     with log_file.open("a") as f:
         f.write(json.dumps(record) + "\n")
 
+def system_stats() -> dict:
+    """Best-effort host stats for the report. Missing tools mean missing keys."""
+    stats: dict = {}
+    try:
+        import psutil
+        stats["cpu_pct"] = psutil.cpu_percent()
+        stats["ram_gb"] = psutil.virtual_memory().used / 1e9
+    except Exception:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output = True, text = True, timeout = 10)
+        utils, mems = [], []
+        for line in out.stdout.strip().splitlines():
+            u, m = line.split(",")
+            utils.append(float(u))
+            mems.append(float(m))
+        if utils:
+            stats["gpu_util_pct"] = sum(utils) / len(utils)
+            stats["gpu_mem_mb"] = sum(mems)
+    except Exception:
+        pass
+    return stats
+
 # dataset
 
 class TextSamplerDataset(Dataset):
@@ -171,6 +198,7 @@ def train(
     log_every: int = 1,
     seed: int = 42,
     disable_tqdm: bool = False,
+    trace_every: int = 10,
 ):
     generate_length = default(generate_length, seq_len)
 
@@ -299,6 +327,16 @@ def train(
                 "train_loss": avg_loss,
                 "bpc_train": avg_loss / math.log(2),
                 "elapsed_s": elapsed,
+                "system": system_stats(),
+            })
+
+        # per-step GPU trace (torch-native, ~free; nvidia-smi util stays at log cadence)
+        if torch.cuda.is_available() and divisible_by(step, trace_every):
+            append_jsonl(log_path, {
+                "type": "gputrace",
+                "step": step,
+                "mem_alloc_mb": torch.cuda.memory_allocated() / 1e6,
+                "mem_reserved_mb": torch.cuda.memory_reserved() / 1e6,
             })
 
         if divisible_by(step, validate_every):

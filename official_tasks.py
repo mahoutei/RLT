@@ -53,6 +53,19 @@ def sample_walk_batch(batch_size: int, n_steps: int, seed: int):
     return seq, (displacement > 0).long()
 
 
+def sample_walk2d_batch(batch_size: int, n_steps: int, seed: int):
+    """2D symmetric walk: tokens 0/1/2/3 mean +x/-x/+y/-y. Returns (seq [B,N],
+    quadrant(final displacement) [B]: 2*sx + sy with sx/sy = 1 iff coord > 0
+    (ties fold to 0, same convention as the 1D walk). Deterministic."""
+    g = torch.Generator().manual_seed(seed)
+    seq = torch.randint(0, 4, (batch_size, n_steps), generator=g)
+    dx = (seq == 0).float() - (seq == 1).float()
+    dy = (seq == 2).float() - (seq == 3).float()
+    sx = (dx.sum(dim=-1) > 0).long()
+    sy = (dy.sum(dim=-1) > 0).long()
+    return seq, (2 * sx + sy).long()
+
+
 def sample_parity_length(rng: random.Random, lo: int = 3, hi: int = 40):
     return rng.randint(lo, hi)
 
